@@ -1,0 +1,265 @@
+import gym
+from gym import spaces
+import numpy as np
+import torchvision
+import torch
+from torchvision.transforms import ToTensor
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from abc import ABC , abstractmethod
+import matplotlib.pyplot as plt
+import random
+
+CORRUPTIONS = [ "translation" ]
+ACTION_COUNTS = { "translation":2 }
+REWARD_SCALAR = 100
+
+def create_empty_cumulative_actions() :
+    """
+    Create an empty dictionary of cumulative actions
+    Returns:
+        the empty dictionary
+    """
+    cumulative_actions = {}
+    for action_name , action_dim in ACTION_COUNTS.items() :
+        cumulative_actions[ action_name ] = np.zeros( action_dim )
+    return cumulative_actions
+
+
+class MnistCorrupted( gym.Env ) :
+    """
+    A subclass of the openai gym environment class.
+    The object of this environment is to undo the transformations which are applied to the original image. 
+    """
+
+    def __init__( self , classifier , max_duration = 50 , selected_corruptions=["translation"] ) :
+        """ Initialize the environment
+        
+        TODO:
+            - modify reward function to penalize actions which do not improve the classification
+            - add more corruptions
+            - pad the image with zeros?
+        Args:
+            reward_fn: a function which takes a MxM image numpy array and the desired label and returns the reward
+            max_duration : maximum number of time step for each trial
+        """
+
+        super().__init__()
+
+        # handle the provided corruptions
+        self._selected_corruptions = selected_corruptions
+        assert np.all( [ corruption in CORRUPTIONS for corruption in self._selected_corruptions ] ) , "One more more supplied corruption types are invalid."
+
+        # setup action and observation spaces
+        self._N_actions = sum( [ ACTION_COUNTS[ corruption ] for corruption in CORRUPTIONS ] ) * 2 # for positive and negative directon for each action type
+        self.action_space = spaces.Discrete( self._N_actions )
+        self.observation_space = spaces.Box( low=0 , high=255 , shape=( 1, 28 , 28 ) , dtype=np.uint8 )
+
+        # load mnist dataset from torchvision
+        # load into a dataloader
+        self._mnist_train = torchvision.datasets.MNIST( root='/mnt/c/Users/daniel.elliott/Downloads/mnist_tmp' , train=True , download=True , transform=ToTensor() )
+        self._train_loader = torch.utils.data.DataLoader( self._mnist_train , batch_size=1 , shuffle=True , num_workers=0 )
+
+        # setup the state variables
+        self._state_img_orig = None
+        self._state_img_label = None
+        self._state_img_classifier_label = None
+        self._state_corruption_params = {} #currently unused
+        self._state_img_corrupted = None
+        self._state_cumulative_actions = create_empty_cumulative_actions()
+        self._state_num_steps = 0
+        self._state_last_action_noop = False #currently unused
+        self._max_duration = max_duration
+
+        # the classifier to use for the reward function
+        self._classifier = classifier
+
+        # create a randomaffine transform based on the selected corruptions
+        self._affine_corruptor = torchvision.transforms.RandomAffine( degrees=0 , 
+                                                                     translate = ( 0.25 , 0.25 ) if "translation" in self._selected_corruptions else ( 0 , 0 ) ,
+                                                                     scale=None , shear=None )
+    
+    def is_done( self ) :
+
+        if self._state_num_steps >= self._max_duration :
+            return True
+        else :
+            return False
+
+    def step( self , action , verbose=False ) :
+
+        self._state_num_steps += 1
+
+        # unpack the action
+        unpacked_action = self.unpack_action( action )
+
+        # accumulate the action
+        self.accumulate_action( unpacked_action )
+
+        # apply the cumulative actions to the original image
+        observation = self.apply_cumulative_actions( )
+
+        # calculate the reward
+        reward = self.reward_function( observation.squeeze().numpy() , verbose=verbose )
+
+        # check if the episode is over
+        done = self.is_done()
+
+        # return the observation, reward, done, truncated, and info
+        return observation.numpy().astype(np.uint8) , reward , done , {}
+    
+    def reset( self ) :
+
+        # reset the cumulative actions
+        self._state_cumulative_actions = create_empty_cumulative_actions()
+
+        # reset the step counter
+        self._state_num_steps = 0
+
+
+        # get the next image from the dataset
+        self._state_img_orig , self._state_img_label = next( iter( self._train_loader ) )
+        self._state_img_orig = self._state_img_orig.squeeze().numpy()
+        self._state_img_label = self._state_img_label.squeeze().numpy()
+
+        # determine the label of the original image using the classifier
+        self._state_img_classifier_label = np.argmax( self._classifier.classify( self._state_img_orig ) )
+
+        # corrupt the image
+        self._state_img_corrupted = self._affine_corruptor( torch.from_numpy( np.expand_dims( self._state_img_orig , axis=0 ) ) ).squeeze().numpy()
+
+        # return the observation
+        return np.expand_dims( self._state_img_corrupted , axis=0 ).astype( np.uint8 )
+
+    def close( self ) :
+        pass
+
+    def count_action_space( self ) :
+
+        return [ ACTION_COUNTS[ corruption ] for corruption in self._selected_corruptions ]
+
+    def unpack_action( self , action_idx ) :
+        """
+        Unpack the action from a scalar to a dictionary of actions.
+        The action index is assumed to be in the order of the selected corruptions and each action has a value in {-1,+1}.  THe negatively-valued action will come first.
+        """
+        idx = 0
+        unpacked_action = {}
+        for action_name in self._selected_corruptions :
+            tmp_size = len( self._state_cumulative_actions[ action_name ] )
+            unpacked_action[ action_name ] = np.zeros( tmp_size )
+            for tmp_idx in range( tmp_size ) :
+                
+                if idx == action_idx :
+                    unpacked_action[ action_name ][ tmp_idx ] = -1
+                idx += 1
+
+                if idx == action_idx :
+                    unpacked_action[ action_name ][ tmp_idx ] = 1
+                idx += 1
+
+        return unpacked_action
+
+    def accumulate_action ( self , unpacked_actions ) :
+
+        for action_name , action_value in unpacked_actions.items() :
+            self._state_cumulative_actions[ action_name ] += action_value
+
+    def reward_function( self , observed_image , verbose=False ) :
+        """
+        Reward function for the environment.
+        TOOD: 
+            Add a penalty for each action taken.
+        Args:
+            observed_image: The image that the agent has observed.
+        Returns:
+            The reward for the current state.
+        """
+        # what does the classifier think the image is?
+        class_inferences = self._classifier.classify( observed_image )
+
+        if verbose :
+            print( f"Class inferences: {class_inferences}" )
+
+        return np.max( class_inferences )
+
+    def apply_cumulative_actions( self ) :
+        """ 
+        Apply the cumulative actions to the original image.
+        First, apply the translation.
+        Second, apply the rotation.
+        Third, apply the scaling.
+        Fourth, apply the shearing.
+        Returns the resulting observation: 1xMxM numpy array.
+        """
+
+        # apply translation
+        observation = torchvision.transforms.functional.affine( torch.from_numpy( np.expand_dims( self._state_img_corrupted , axis=0 ) ), 
+                                                               angle = 0 , 
+                                                               translate=self._state_cumulative_actions[ "translation" ].tolist() ,
+                                                               scale = 1 , shear=0 )
+
+        # # apply rotation
+        # observation = torchvision.transforms.functional.affine( self._state_img_corrupted , 
+        #                                                        angle = self._state_cumulative_actions[ "rotation" ][0] , 
+        #                                                        translate=(0,0) ,
+        #                                                        scale = 1 , shear=0 )
+
+        # # apply scaling
+        # observation = torchvision.transforms.functional.affine( observation , 
+        #                                                        angle = 0 , 
+        #                                                        translate=(0,0) ,
+        #                                                        scale = self._state_cumulative_actions[ "scaling" ][0] , shear=0 )
+
+        # # apply shearing
+        # observation = torchvision.transforms.functional.affine( observation , 
+        #                                                        angle = 0 , 
+        #                                                        translate=(0,0) ,
+        #                                                        scale = 1 , shear=self._state_cumulative_actions[ "shearing" ][0] )
+
+        return observation
+    
+    def render( self , mode='human' , fig_in=None ) :
+        """
+        Draw the current state of the environment.
+        If fig_in is None, create a new figure. Otherwise, update the figure.
+        Figure consists of three subplots:
+            1. Original image
+            2. Current image
+            3. Corrupted image
+        """
+        
+        if mode != 'human' :
+            raise NotImplementedError( "Only human mode is supported." )
+
+        observation = self.apply_cumulative_actions( ).squeeze().numpy()
+
+        if not fig_in :
+
+            fig = plt.figure()
+            ax_orig = fig.add_subplot( 1 , 3 , 1 )
+            ax_orig.set_title( "Original" )
+            im_orig = ax_orig.imshow( self._state_img_orig )
+            ax_current = fig.add_subplot( 1 , 3 , 2 )
+            ax_current.set_title( "Observed" )
+            im_current = ax_current.imshow( observation )
+            ax_corr = fig.add_subplot( 1 , 3 , 3 )
+            ax_corr.set_title( "Corrupted" )
+            im_corr = ax_corr.imshow( self._state_img_corrupted )
+            fig.show()
+
+        else :
+
+            ax_orig = fig_in.axes[ 0 ]
+            ax_orig.images[ 0 ].set_data( self._state_img_orig )
+            ax_current = fig_in.axes[ 1 ]
+            ax_current.images[ 0 ].set_data( np.squeeze( observation ) )
+            ax_corr = fig_in.axes[ 2 ]
+            ax_corr.images[ 0 ].set_data( self._state_img_corrupted )
+            fig_in.canvas.draw()
+            fig_in.canvas.flush_events()
+            fig = fig_in
+
+        return fig
+
