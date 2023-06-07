@@ -3,7 +3,7 @@ from gym import spaces
 import numpy as np
 import torchvision
 import torch
-from torchvision.transforms import ToTensor
+from torchvision.transforms import ToTensor, Pad , CenterCrop , RandomAffine
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -14,6 +14,8 @@ import random
 CORRUPTIONS = [ "translation" ]
 ACTION_COUNTS = { "translation":2 }
 REWARD_SCALAR = 100
+MNIST_ORIG_SIZE = 28
+MIN_IMG_SIZE = 36
 
 def create_empty_cumulative_actions() :
     """
@@ -31,18 +33,21 @@ class MnistCorrupted( gym.Env ) :
     """
     A subclass of the openai gym environment class.
     The object of this environment is to undo the transformations which are applied to the original image. 
+    The environment is initialized with a classifier which is used to determine the reward for each action.
+    A pad of zeros is added to the image to allow for translation and to make sure the image is large enough for the default-sized CNN.
     """
 
-    def __init__( self , classifier , max_duration = 50 , selected_corruptions=["translation"] ) :
+    def __init__( self , classifier , img_pad_size = 10 , max_duration = 50 , selected_corruptions=["translation"] ) :
         """ Initialize the environment
         
         TODO:
             - modify reward function to penalize actions which do not improve the classification
             - add more corruptions
-            - pad the image with zeros?
         Args:
-            reward_fn: a function which takes a MxM image numpy array and the desired label and returns the reward
+            classifier: the classifier to use for the reward function.  Must be a subclass of MnistClassifier.
+            img_pad_size: the number of zeros to pad the image with in each direction.
             max_duration : maximum number of time step for each trial
+            selected_corruptions: a list of of strings.  Each string is a corruption name which must be found in CORRUPTIONS.
         """
 
         super().__init__()
@@ -51,14 +56,21 @@ class MnistCorrupted( gym.Env ) :
         self._selected_corruptions = selected_corruptions
         assert np.all( [ corruption in CORRUPTIONS for corruption in self._selected_corruptions ] ) , "One more more supplied corruption types are invalid."
 
+        # compute observation space size
+        self._img_pad_size = img_pad_size
+        self._img_size = MNIST_ORIG_SIZE + 2 * self._img_pad_size
+        if self._img_size < MIN_IMG_SIZE :
+            #throw exception
+            raise Exception( "The image size is too small.  The image size must be at least 36 pixels." )
+
         # setup action and observation spaces
         self._N_actions = sum( [ ACTION_COUNTS[ corruption ] for corruption in CORRUPTIONS ] ) * 2 # for positive and negative directon for each action type
         self.action_space = spaces.Discrete( self._N_actions )
-        self.observation_space = spaces.Box( low=0 , high=255 , shape=( 1, 28 , 28 ) , dtype=np.uint8 )
+        self.observation_space = spaces.Box( low=0 , high=255 , shape=( self._img_size , self._img_size , 1 ) , dtype=np.uint8 )
 
         # load mnist dataset from torchvision
         # load into a dataloader
-        self._mnist_train = torchvision.datasets.MNIST( root='/mnt/c/Users/daniel.elliott/Downloads/mnist_tmp' , train=True , download=True , transform=ToTensor() )
+        self._mnist_train = torchvision.datasets.MNIST( root='/mnt/c/Users/daniel.elliott/Downloads/mnist_tmp' , train=True , download=True , transform=lambda x: ToTensor()(Pad( self._img_pad_size, fill=0 )(x)) )
         self._train_loader = torch.utils.data.DataLoader( self._mnist_train , batch_size=1 , shuffle=True , num_workers=0 )
 
         # setup the state variables
@@ -76,9 +88,12 @@ class MnistCorrupted( gym.Env ) :
         self._classifier = classifier
 
         # create a randomaffine transform based on the selected corruptions
-        self._affine_corruptor = torchvision.transforms.RandomAffine( degrees=0 , 
-                                                                     translate = ( 0.25 , 0.25 ) if "translation" in self._selected_corruptions else ( 0 , 0 ) ,
-                                                                     scale=None , shear=None )
+        self._affine_corruptor = RandomAffine( degrees=0 , 
+                                                translate = ( 0.25 , 0.25 ) if "translation" in self._selected_corruptions else ( 0 , 0 ) ,
+                                                scale=None , shear=None )
+        
+        # we'll use this to crop the image back to the original size
+        self._cropper = CenterCrop( size=MNIST_ORIG_SIZE )
     
     def is_done( self ) :
 
@@ -124,13 +139,14 @@ class MnistCorrupted( gym.Env ) :
         self._state_img_label = self._state_img_label.squeeze().numpy()
 
         # determine the label of the original image using the classifier
-        self._state_img_classifier_label = np.argmax( self._classifier.classify( self._state_img_orig ) )
+        tmp_img = self._cropper( torch.from_numpy( np.expand_dims( self._state_img_orig , axis=2 ) ) ).squeeze().numpy()
+        self._state_img_classifier_label = np.argmax( self._classifier.classify( tmp_img ) )
 
         # corrupt the image
-        self._state_img_corrupted = self._affine_corruptor( torch.from_numpy( np.expand_dims( self._state_img_orig , axis=0 ) ) ).squeeze().numpy()
+        self._state_img_corrupted = self._affine_corruptor( torch.from_numpy( np.expand_dims( self._state_img_orig , axis=2 ) ) ).squeeze().numpy()
 
         # return the observation
-        return np.expand_dims( self._state_img_corrupted , axis=0 ).astype( np.uint8 )
+        return np.expand_dims( self._state_img_corrupted , axis=2 ).astype( np.uint8 )
 
     def close( self ) :
         pass
@@ -177,7 +193,8 @@ class MnistCorrupted( gym.Env ) :
             The reward for the current state.
         """
         # what does the classifier think the image is?
-        class_inferences = self._classifier.classify( observed_image )
+        tmp_img = self._cropper( torch.from_numpy( np.rollaxis( np.expand_dims( observed_image , axis=2 ) , axis=2 , start=0 ) ) ).squeeze().numpy()
+        class_inferences = self._classifier.classify( tmp_img )
 
         if verbose :
             print( f"Class inferences: {class_inferences}" )
@@ -195,7 +212,7 @@ class MnistCorrupted( gym.Env ) :
         """
 
         # apply translation
-        observation = torchvision.transforms.functional.affine( torch.from_numpy( np.expand_dims( self._state_img_corrupted , axis=0 ) ), 
+        observation = torchvision.transforms.functional.affine( torch.from_numpy( np.expand_dims( self._state_img_corrupted , axis=2 ) ), 
                                                                angle = 0 , 
                                                                translate=self._state_cumulative_actions[ "translation" ].tolist() ,
                                                                scale = 1 , shear=0 )
