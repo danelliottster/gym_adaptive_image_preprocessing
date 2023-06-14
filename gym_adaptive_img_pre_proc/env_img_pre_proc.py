@@ -3,7 +3,7 @@ from gym import spaces
 import numpy as np
 import torchvision
 import torch
-from torchvision.transforms import ToTensor, Pad , CenterCrop , RandomAffine
+from torchvision.transforms import ToTensor, Pad , CenterCrop , RandomAffine, ColorJitter
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -11,8 +11,11 @@ from abc import ABC , abstractmethod
 import matplotlib.pyplot as plt
 import random
 
-CORRUPTIONS = [ "translation" ]
-ACTION_COUNTS = { "translation":2 }
+CORRUPTIONS = [ 'translation' , 'rotation' , 'brightness' ]
+ACTION_COUNTS = { 'translation':2 , 'rotation':1 , 'brightness':1 }
+ACTION_SCALES = { 'translation':1 , 'rotation':1 , 'brightness':0.1 }
+ACTION_INIT_VALS = { 'translation':0 , 'rotation':0 , 'brightness':1 }
+ACTION_RANGE = { 'translation':[-40,40] , 'rotation':[-45,45] , 'brightness':[0.4,5] }
 REWARD_SCALAR = 100
 MNIST_ORIG_SIZE = 28
 MIN_IMG_SIZE = 36
@@ -25,7 +28,8 @@ def create_empty_cumulative_actions() :
     """
     cumulative_actions = {}
     for action_name , action_dim in ACTION_COUNTS.items() :
-        cumulative_actions[ action_name ] = np.zeros( action_dim )
+        init_val = ACTION_INIT_VALS[ action_name ]
+        cumulative_actions[ action_name ] = np.zeros( action_dim ) + init_val
     return cumulative_actions
 
 
@@ -87,10 +91,11 @@ class MnistCorrupted( gym.Env ) :
         # the classifier to use for the reward function
         self._classifier = classifier
 
-        # create a randomaffine transform based on the selected corruptions
-        self._affine_corruptor = RandomAffine( degrees=0 , 
-                                                translate = ( 0.25 , 0.25 ) if "translation" in self._selected_corruptions else ( 0 , 0 ) ,
+        # create corruption functions
+        self._affine_corruptor = RandomAffine( degrees=45 if "rotation" in self._selected_corruptions else 0 , 
+                                                translate = ( 0.40 , 0.30 ) if "translation" in self._selected_corruptions else ( 0 , 0 ) ,
                                                 scale=None , shear=None )
+        self._brightness_corruptor = ColorJitter( brightness = 0.5 if "brightness" in self._selected_corruptions else 0 )
         
         # we'll use this to crop the image back to the original size
         self._cropper = CenterCrop( size=MNIST_ORIG_SIZE )
@@ -143,7 +148,8 @@ class MnistCorrupted( gym.Env ) :
         self._state_img_classifier_label = np.argmax( self._classifier.classify( tmp_img ) )
 
         # corrupt the image
-        self._state_img_corrupted = self._affine_corruptor( torch.from_numpy( np.expand_dims( self._state_img_orig , axis=2 ) ) ).squeeze().numpy()
+        self._state_img_corrupted = self._affine_corruptor( torch.from_numpy( np.expand_dims( self._state_img_orig , axis=0 ) ) )
+        self._state_img_corrupted = self._brightness_corruptor( self._state_img_corrupted ).squeeze().numpy()
 
         # return the observation
         return np.expand_dims( self._state_img_corrupted , axis=2 ).astype( np.uint8 )
@@ -163,16 +169,17 @@ class MnistCorrupted( gym.Env ) :
         idx = 0
         unpacked_action = {}
         for action_name in self._selected_corruptions :
+            action_scale = ACTION_SCALES[ action_name ]
             tmp_size = len( self._state_cumulative_actions[ action_name ] )
             unpacked_action[ action_name ] = np.zeros( tmp_size )
             for tmp_idx in range( tmp_size ) :
                 
                 if idx == action_idx :
-                    unpacked_action[ action_name ][ tmp_idx ] = -1
+                    unpacked_action[ action_name ][ tmp_idx ] = -1 * action_scale
                 idx += 1
 
                 if idx == action_idx :
-                    unpacked_action[ action_name ][ tmp_idx ] = 1
+                    unpacked_action[ action_name ][ tmp_idx ] = 1 * action_scale
                 idx += 1
 
         return unpacked_action
@@ -180,7 +187,10 @@ class MnistCorrupted( gym.Env ) :
     def accumulate_action ( self , unpacked_actions ) :
 
         for action_name , action_value in unpacked_actions.items() :
+            min_val = ACTION_RANGE[ action_name ][0]
+            max_val = ACTION_RANGE[ action_name ][1]
             self._state_cumulative_actions[ action_name ] += action_value
+            self._state_cumulative_actions[ action_name ] = np.clip( self._state_cumulative_actions[ action_name ] , min_val , max_val )
 
     def reward_function( self , observed_image , verbose=False ) :
         """
@@ -208,20 +218,23 @@ class MnistCorrupted( gym.Env ) :
         Second, apply the rotation.
         Third, apply the scaling.
         Fourth, apply the shearing.
-        Returns the resulting observation: 1xMxM numpy array.
+        Returns the resulting observation: MxMx1 numpy array.
         """
 
         # apply translation
-        observation = torchvision.transforms.functional.affine( torch.from_numpy( np.expand_dims( self._state_img_corrupted , axis=2 ) ), 
+        observation = torchvision.transforms.functional.affine( torch.from_numpy( np.expand_dims( self._state_img_corrupted , axis=0 ) ), 
                                                                angle = 0 , 
                                                                translate=self._state_cumulative_actions[ "translation" ].tolist() ,
                                                                scale = 1 , shear=0 )
 
-        # # apply rotation
-        # observation = torchvision.transforms.functional.affine( self._state_img_corrupted , 
-        #                                                        angle = self._state_cumulative_actions[ "rotation" ][0] , 
-        #                                                        translate=(0,0) ,
-        #                                                        scale = 1 , shear=0 )
+        # apply rotation
+        observation = torchvision.transforms.functional.affine( observation , 
+                                                               angle = self._state_cumulative_actions[ "rotation" ][0] , 
+                                                               translate=(0,0) ,
+                                                               scale = 1 , shear=0 )
+        
+        # apply brightness
+        observation = torchvision.transforms.functional.adjust_brightness( observation , self._state_cumulative_actions[ "brightness" ][0] )
 
         # # apply scaling
         # observation = torchvision.transforms.functional.affine( observation , 
@@ -234,6 +247,8 @@ class MnistCorrupted( gym.Env ) :
         #                                                        angle = 0 , 
         #                                                        translate=(0,0) ,
         #                                                        scale = 1 , shear=self._state_cumulative_actions[ "shearing" ][0] )
+
+        observation = observation.squeeze().unsqueeze(2)
 
         return observation
     
@@ -257,13 +272,13 @@ class MnistCorrupted( gym.Env ) :
             fig = plt.figure()
             ax_orig = fig.add_subplot( 1 , 3 , 1 )
             ax_orig.set_title( "Original" )
-            im_orig = ax_orig.imshow( self._state_img_orig )
+            im_orig = ax_orig.imshow( self._state_img_orig , cmap='gray' )
             ax_current = fig.add_subplot( 1 , 3 , 2 )
             ax_current.set_title( "Observed" )
-            im_current = ax_current.imshow( observation )
+            im_current = ax_current.imshow( observation , cmap='gray' )
             ax_corr = fig.add_subplot( 1 , 3 , 3 )
             ax_corr.set_title( "Corrupted" )
-            im_corr = ax_corr.imshow( self._state_img_corrupted )
+            im_corr = ax_corr.imshow( self._state_img_corrupted , cmap='gray' )
             fig.show()
 
         else :
