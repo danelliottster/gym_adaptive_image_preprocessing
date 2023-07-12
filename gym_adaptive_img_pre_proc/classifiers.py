@@ -11,13 +11,13 @@ import matplotlib.pyplot as plt
 
 class MnistClassifier( ABC ) :
 
-    def __init__( self ) :
+    def __init__( self , root_dir_in ) :
 
         # load the MNIST training data set
-        self._mnist_train = torchvision.datasets.MNIST( root='/mnt/c/Users/daniel.elliott/Downloads/mnist_tmp' , train=True , download=True , transform=ToTensor() )
+        self._mnist_train = torchvision.datasets.MNIST( root=root_dir_in , train=True , download=True , transform=ToTensor() )
         self._train_loader = torch.utils.data.DataLoader( self._mnist_train , batch_size=1 , shuffle=True , num_workers=0 )
         # load the MNIST test data set
-        self._mnist_test = torchvision.datasets.MNIST( root='/mnt/c/Users/daniel.elliott/Downloads/mnist_tmp' , train=False , download=True , transform=ToTensor() )
+        self._mnist_test = torchvision.datasets.MNIST( root=root_dir_in , train=False , download=True , transform=ToTensor() )
         self._test_loader = torch.utils.data.DataLoader( self._mnist_test , batch_size=1 , shuffle=True , num_workers=0 )
 
 
@@ -47,7 +47,7 @@ class MnistClassifierCNN( MnistClassifier ) :
 
     class MnistCNN( nn.Module ) :
             
-        def __init__( self ) :
+        def __init__( self , root_dir_in ) :
 
             super().__init__()
 
@@ -67,9 +67,9 @@ class MnistClassifierCNN( MnistClassifier ) :
             x = self._fc2( x )
             
 
-    def __init__( self ) : 
+    def __init__( self , root_dir_in ) : 
 
-        super().__init__()
+        super().__init__( root_dir_in=root_dir_in)
         # the classifier
         self._classifier = self.MnistCNN()
 
@@ -126,9 +126,9 @@ class MnistClassifierAutoCorr( MnistClassifier ) :
     Should be a good test for the agent with a more informative reward during training.
     """
 
-    def __init__( self ) :
+    def __init__( self , root_dir_in ) :
 
-        super().__init__()
+        super().__init__(root_dir_in=root_dir_in)
 
     def plot_mean_images( self ) :
 

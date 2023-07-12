@@ -41,12 +41,13 @@ class MnistCorrupted( gym.Env ) :
     A pad of zeros is added to the image to allow for translation and to make sure the image is large enough for the default-sized CNN.
     """
 
-    def __init__( self , classifier , img_pad_size = 10 , max_duration = 50 , selected_corruptions=["translation"] ) :
+    def __init__( self , classifier , img_pad_size = 10 , max_duration = 50 , selected_corruptions=["translation"] , test_env=False , num_test_imgs=25 ) :
         """ Initialize the environment
         
         TODO:
             - modify reward function to penalize actions which do not improve the classification
             - add more corruptions
+            - add a null action
         Args:
             classifier: the classifier to use for the reward function.  Must be a subclass of MnistClassifier.
             img_pad_size: the number of zeros to pad the image with in each direction.
@@ -77,6 +78,15 @@ class MnistCorrupted( gym.Env ) :
         self._mnist_train = torchvision.datasets.MNIST( root='/mnt/c/Users/daniel.elliott/Downloads/mnist_tmp' , train=True , download=True , transform=lambda x: ToTensor()(Pad( self._img_pad_size, fill=0 )(x)) )
         self._train_loader = torch.utils.data.DataLoader( self._mnist_train , batch_size=1 , shuffle=True , num_workers=0 )
 
+        # create a loader for the test set
+        self.num_test_imgs = num_test_imgs
+        if test_env :
+            self._mnist_test = self._mnist_train.data[ random.sample( range(60000) , num_test_imgs ) , : , : ]
+            self._test_loader = torch.utils.data.DataLoader( self._mnist_test , batch_size=1 , shuffle=False , num_workers=0 )
+        else :
+            self._mnist_test = None
+            self._test_loader = None
+
         # setup the state variables
         self._state_img_orig = None
         self._state_img_label = None
@@ -99,11 +109,34 @@ class MnistCorrupted( gym.Env ) :
         
         # we'll use this to crop the image back to the original size
         self._cropper = CenterCrop( size=MNIST_ORIG_SIZE )
+
+    def check_if_observation_is_blank( self , observation ) :
+
+        if np.max( observation ) == 0 :
+            return True
+        else :
+            return False
     
-    def is_done( self ) :
+    def is_done( self , observation , verbose=0 ) :
+        """
+        Check if the episode is done.  Episode is done if number of steps exceeds max duration or if all pixels are zero.
+        Args:
+            observation: the current observation as a numpy ndarray
+            verbose: if > 0, print messages to the console
+        Returns:
+            True if the episode is done, False otherwise
+        """
 
         if self._state_num_steps >= self._max_duration :
+            if verbose > 0 :
+                print( "Max duration reached.  Terminating trial." )
             return True
+        
+        if self.check_if_observation_is_blank( observation ) :
+            if verbose > 0 :
+                print( "All pixels are zero.  Terminating trial." )
+            return True
+        
         else :
             return False
 
@@ -124,7 +157,7 @@ class MnistCorrupted( gym.Env ) :
         reward = self.reward_function( observation.squeeze().numpy() , verbose=verbose )
 
         # check if the episode is over
-        done = self.is_done()
+        done = self.is_done( observation=observation.squeeze().numpy() , verbose=verbose )
 
         # return the observation, reward, done, truncated, and info
         return observation.numpy().astype(np.uint8) , reward , done , {}
@@ -137,9 +170,11 @@ class MnistCorrupted( gym.Env ) :
         # reset the step counter
         self._state_num_steps = 0
 
-
         # get the next image from the dataset
-        self._state_img_orig , self._state_img_label = next( iter( self._train_loader ) )
+        if self._test_loader is None :
+            self._state_img_orig , self._state_img_label = next( iter( self._train_loader ) )
+        else :
+            self._state_img_orig , self._state_img_label = next( iter( self._test_loader ) )
         self._state_img_orig = self._state_img_orig.squeeze().numpy()
         self._state_img_label = self._state_img_label.squeeze().numpy()
 
@@ -150,6 +185,17 @@ class MnistCorrupted( gym.Env ) :
         # corrupt the image
         self._state_img_corrupted = self._affine_corruptor( torch.from_numpy( np.expand_dims( self._state_img_orig , axis=0 ) ) )
         self._state_img_corrupted = self._brightness_corruptor( self._state_img_corrupted ).squeeze().numpy()
+
+        # return the observation
+        return np.expand_dims( self._state_img_corrupted , axis=2 ).astype( np.uint8 )
+        
+    def partial_reset( self ) :
+
+        # reset the cumulative actions
+        self._state_cumulative_actions = create_empty_cumulative_actions()
+
+        # reset the step counter
+        self._state_num_steps = 0
 
         # return the observation
         return np.expand_dims( self._state_img_corrupted , axis=2 ).astype( np.uint8 )
@@ -198,18 +244,25 @@ class MnistCorrupted( gym.Env ) :
         TOOD: 
             Add a penalty for each action taken.
         Args:
-            observed_image: The image that the agent has observed.
+            observed_image: The image that the agent has observed.  A numpy ndarray.
         Returns:
             The reward for the current state.
         """
+        reward = 0.0
+
         # what does the classifier think the image is?
         tmp_img = self._cropper( torch.from_numpy( np.rollaxis( np.expand_dims( observed_image , axis=2 ) , axis=2 , start=0 ) ) ).squeeze().numpy()
         class_inferences = self._classifier.classify( tmp_img )
 
+        if ( self.check_if_observation_is_blank( observed_image ) ) :
+            reward -= 100.0
+
         if verbose :
             print( f"Class inferences: {class_inferences}" )
 
-        return np.max( class_inferences )
+        reward += np.max( class_inferences )
+
+        return reward
 
     def apply_cumulative_actions( self ) :
         """ 

@@ -1,10 +1,14 @@
+#[build-system]
+#requires = ["hatchling"]
+#build-backend = "hatchling.build"
+
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "gym_adaptive_img_pre_proc"
-version = "0.9.0"
+version = "0.9.3"
 authors = [
   { name="Daniel Elliott", email="danelliottster@gmail.com" },
 ]
@@ -16,6 +20,14 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
+dependencies = [
+    "torch",
+    "torchvision",
+    "gym",
+    "numpy",
+    "opencv-python",
+    "matplotlib"
+] 
 
 [project.urls]
 "Homepage" = "https://github.com/danelliottster/gym_adaptive_image_preprocessing"
