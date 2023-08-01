@@ -53,9 +53,30 @@ class MnistCorrupted( gym.Env ) :
             img_pad_size: the number of zeros to pad the image with in each direction.
             max_duration : maximum number of time step for each trial
             selected_corruptions: a list of of strings.  Each string is a corruption name which must be found in CORRUPTIONS.
+            test_env: if True, the environment will use the test set instead of the training set.
+            num_test_imgs: the number of test images to use when evaluating performance. Only used if test_env is True.
         """
 
         super().__init__()
+
+        # the data loader used when this is a test environment.  Will be None if this is not a test environment.
+        self._test_loader = None
+        # the list of corruptions to use with this environment.
+        self._selected_corruptions = None
+        # the amount of padding to add to the image
+        self._img_pad_size = None
+        # the size of the image
+        self._img_size = None
+        # the number of actions in the action space
+        self._N_actions = None
+        # the action space
+        self.action_space = None
+        # the observation space
+        self.observation_space = None
+        # the MNIST training/testing data sets
+        self._mnist_train = None
+        self._mnist_test = None
+        
 
         # handle the provided corruptions
         self._selected_corruptions = selected_corruptions
@@ -173,10 +194,12 @@ class MnistCorrupted( gym.Env ) :
         # get the next image from the dataset
         if self._test_loader is None :
             self._state_img_orig , self._state_img_label = next( iter( self._train_loader ) )
+            self._state_img_label = self._state_img_label.squeeze().numpy()
         else :
-            self._state_img_orig , self._state_img_label = next( iter( self._test_loader ) )
+            self._state_img_orig = next( iter( self._test_loader ) )
+            self._state_img_label = None
+
         self._state_img_orig = self._state_img_orig.squeeze().numpy()
-        self._state_img_label = self._state_img_label.squeeze().numpy()
 
         # determine the label of the original image using the classifier
         tmp_img = self._cropper( torch.from_numpy( np.expand_dims( self._state_img_orig , axis=2 ) ) ).squeeze().numpy()
@@ -243,6 +266,7 @@ class MnistCorrupted( gym.Env ) :
         Reward function for the environment.
         TOOD: 
             Add a penalty for each action taken.
+            Use the correct classification in the reward computation.
         Args:
             observed_image: The image that the agent has observed.  A numpy ndarray.
         Returns:
