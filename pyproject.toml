@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gym_adaptive_img_pre_proc"
-version = "0.9.3"
+version = "0.9.4"
 authors = [
   { name="Daniel Elliott", email="danelliottster@gmail.com" },
 ]

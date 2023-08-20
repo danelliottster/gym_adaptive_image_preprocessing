@@ -4,12 +4,13 @@ import numpy as np
 import torchvision
 import torch
 from torchvision.transforms import ToTensor, Pad , CenterCrop , RandomAffine, ColorJitter
-import torch.nn as nn
+import torch.nn as nntorch
 import torch.nn.functional as F
 import torch.optim as optim
 from abc import ABC , abstractmethod
 import matplotlib.pyplot as plt
 import random
+from sklearn.cluster import KMeans
 
 CORRUPTIONS = [ 'translation' , 'rotation' , 'brightness' ]
 ACTION_COUNTS = { 'translation':2 , 'rotation':1 , 'brightness':1 }
@@ -76,6 +77,10 @@ class MnistCorrupted( gym.Env ) :
         # the MNIST training/testing data sets
         self._mnist_train = None
         self._mnist_test = None
+        self._N_train = None
+        self._N_test = None
+        # the number of randomly-selected test images to use
+        self.num_test_imgs = None
         
 
         # handle the provided corruptions
@@ -98,6 +103,7 @@ class MnistCorrupted( gym.Env ) :
         # load into a dataloader
         self._mnist_train = torchvision.datasets.MNIST( root='/mnt/c/Users/daniel.elliott/Downloads/mnist_tmp' , train=True , download=True , transform=lambda x: ToTensor()(Pad( self._img_pad_size, fill=0 )(x)) )
         self._train_loader = torch.utils.data.DataLoader( self._mnist_train , batch_size=1 , shuffle=True , num_workers=0 )
+        self._N_train = self._mnist_train.data.shape[0]
 
         # create a loader for the test set
         self.num_test_imgs = num_test_imgs
@@ -111,7 +117,6 @@ class MnistCorrupted( gym.Env ) :
         # setup the state variables
         self._state_img_orig = None
         self._state_img_label = None
-        self._state_img_classifier_label = None
         self._state_corruption_params = {} #currently unused
         self._state_img_corrupted = None
         self._state_cumulative_actions = create_empty_cumulative_actions()
@@ -203,7 +208,6 @@ class MnistCorrupted( gym.Env ) :
 
         # determine the label of the original image using the classifier
         tmp_img = self._cropper( torch.from_numpy( np.expand_dims( self._state_img_orig , axis=2 ) ) ).squeeze().numpy()
-        self._state_img_classifier_label = np.argmax( self._classifier.classify( tmp_img ) )
 
         # corrupt the image
         self._state_img_corrupted = self._affine_corruptor( torch.from_numpy( np.expand_dims( self._state_img_orig , axis=0 ) ) )
@@ -372,3 +376,99 @@ class MnistCorrupted( gym.Env ) :
 
         return fig
 
+class MnistCorrupted_kmeans( MnistCorrupted ) :
+
+    def __init__( self , img_pad_size = 10 , max_duration = 50 , selected_corruptions=["translation"] , test_env=False , num_test_imgs=25 , K = 50 ) :
+
+        super( MnistCorrupted_kmeans , self ).__init__( None , img_pad_size , max_duration , selected_corruptions , test_env , num_test_imgs )
+
+        self._K = None
+        self._cluster_labels = None
+        self._cluster_ratios = None
+
+        # number of clusters
+        self._K = K
+
+        # redefine the observation space to match this evnironment
+        self.observation_space = spaces.Box(                 low=0 , high=255 , shape=( MNIST_ORIG_SIZE , MNIST_ORIG_SIZE , self._K + 1 ) , dtype=np.uint8 )
+
+        # create kmeans training data from the training data loader
+        X = self._mnist_train.data.numpy().reshape( self._N_train , MNIST_ORIG_SIZE*MNIST_ORIG_SIZE )
+
+        # fit the kmeans model
+        self._kmeans = KMeans( n_clusters=self._K , random_state=0 )
+        self._kmeans.fit( X )
+
+        # determine the cluster labels
+        self.determine_cluster_labels()
+
+    def determine_cluster_labels( self ) :
+
+        # determine the cluster labels
+        self._cluster_labels = np.zeros( self._K )
+        self._cluster_ratios = np.zeros( ( self._K , 10 ) )
+        for k in range( self._K ) :
+            tmp = self._mnist_train.targets.numpy()[ self._kmeans.labels_ == k ]
+            self._cluster_labels[ k ] = np.argmax( np.bincount( tmp , minlength=10 ) )
+            self._cluster_ratios[ k , : ] = np.bincount( tmp , minlength=10 ) / float( len( tmp ) )
+
+    def reward_function(self, observed_image, verbose=False):
+        
+        # what does the classifier think the image is?
+        tmp_img = self._cropper( torch.from_numpy( np.rollaxis( np.expand_dims( observed_image , axis=2 ) , axis=2 , start=0 ) ) ).squeeze().numpy()
+        yhat = self._kmeans.predict( tmp_img.flatten().reshape(1,-1).astype(float) )[0]
+
+        if self.check_if_observation_is_blank( observed_image ) :
+            return -100.0
+        
+        correct_class_ratio = self._cluster_ratios[ yhat , self._state_img_label ]
+        reward = 200.0 * correct_class_ratio - 100.0
+        return reward
+    
+    def build_full_observation( self , observation_current ) :
+        """
+        Build an observation by adding the cluster means to the observation.
+        Args:
+            observation_current: the current observation as a numpy ndarray
+        Returns:
+            The full observation as a numpy ndarray
+        """
+
+        observation_full = self._kmeans.cluster_centers_.reshape( self._K , MNIST_ORIG_SIZE , MNIST_ORIG_SIZE )
+        observation_full = np.concatenate( ( observation_full , self._cropper( torch.movedim( torch.from_numpy( observation_current ) , 2 , 0 ) ) ) , axis=0 )
+        observation_full = np.moveaxis( observation_full , 0 , 2 )
+        return observation_full
+    
+    def step( self , action , verbose=False ) :
+
+        observation_tmp , reward , done , _ = super( MnistCorrupted_kmeans , self ).step( action , verbose )
+
+        observation_full = self.build_full_observation( observation_tmp )
+
+        return observation_full.astype(np.uint8) , reward , done , {}
+    
+    def reset( self ) :
+
+        super( MnistCorrupted_kmeans , self ).reset()
+
+        # create an observation the easy way with an empty set of actions
+        observation = self.apply_cumulative_actions( )
+        observation_full = self.build_full_observation( observation.numpy() )
+
+        return observation_full.astype( np.uint8 )
+
+    def render_means( self ) : 
+
+        nrows = int( np.ceil( np.sqrt( self._K ) ) )
+        ncols = int( np.ceil( np.sqrt( self._K ) ) )
+
+        fig = plt.figure()
+        for k in range( self._K ) :
+            ax = fig.add_subplot( nrows , ncols , k+1 )
+            ax.set_title( f"Class {self._cluster_labels[k]}" )
+            ax.imshow( self._kmeans.cluster_centers_[ k ].reshape( MNIST_ORIG_SIZE , MNIST_ORIG_SIZE ) , cmap='gray' )
+            ax.set_xticks([])
+            ax.set_yticks([])
+        fig.show()
+
+        return fig
