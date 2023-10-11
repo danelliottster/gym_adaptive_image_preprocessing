@@ -66,8 +66,10 @@ class MnistCorrupted( gym.Env ) :
         self._selected_corruptions = None
         # the amount of padding to add to the image
         self._img_pad_size = None
-        # the size of the image
+        # the size of the image after corruption and padding
         self._img_size = None
+        # the original image for the current trial as a ndarray of size _img_size x _img_size
+        self._state_img_orig = None
         # the number of actions in the action space
         self._N_actions = None
         # the action space
@@ -99,16 +101,22 @@ class MnistCorrupted( gym.Env ) :
         self.action_space = spaces.Discrete( self._N_actions )
         self.observation_space = spaces.Box( low=0 , high=255 , shape=( self._img_size , self._img_size , 1 ) , dtype=np.uint8 )
 
+        # define the padding transform so we can use it later
+        self._pad_func = Pad( self._img_pad_size , fill=0 )
+
         # load mnist dataset from torchvision
         # load into a dataloader
-        self._mnist_train = torchvision.datasets.MNIST( root='/mnt/c/Users/daniel.elliott/Downloads/mnist_tmp' , train=True , download=True , transform=lambda x: ToTensor()(Pad( self._img_pad_size, fill=0 )(x)) )
+        self._mnist_train = torchvision.datasets.MNIST( root='/mnt/c/Users/daniel.elliott/Downloads/mnist_tmp' , train=True , download=True , transform=lambda x: ToTensor()(self._pad_func(x)) )
         self._train_loader = torch.utils.data.DataLoader( self._mnist_train , batch_size=1 , shuffle=True , num_workers=0 )
         self._N_train = self._mnist_train.data.shape[0]
 
         # create a loader for the test set
         self.num_test_imgs = num_test_imgs
         if test_env :
-            self._mnist_test = self._mnist_train.data[ random.sample( range(60000) , num_test_imgs ) , : , : ]
+            tmp_test_data = self._mnist_train.data[ random.sample( range(60000) , num_test_imgs ) , : , : ]
+            self._mnist_test = np.zeros( ( num_test_imgs , self._img_size , self._img_size ) )
+            for i in range( num_test_imgs ) :
+                self._mnist_test = self._pad_func( self._mnist_train.data[ i , : , : ] ).numpy()
             self._test_loader = torch.utils.data.DataLoader( self._mnist_test , batch_size=1 , shuffle=False , num_workers=0 )
         else :
             self._mnist_test = None
@@ -209,12 +217,23 @@ class MnistCorrupted( gym.Env ) :
         # determine the label of the original image using the classifier
         tmp_img = self._cropper( torch.from_numpy( np.expand_dims( self._state_img_orig , axis=2 ) ) ).squeeze().numpy()
 
-        # corrupt the image
-        self._state_img_corrupted = self._affine_corruptor( torch.from_numpy( np.expand_dims( self._state_img_orig , axis=0 ) ) )
-        self._state_img_corrupted = self._brightness_corruptor( self._state_img_corrupted ).squeeze().numpy()
+        # corrupt the original image
+        self._state_img_corrupted = self.corrupt_image( self._state_img_orig )
 
         # return the observation
         return np.expand_dims( self._state_img_corrupted , axis=2 ).astype( np.uint8 )
+    
+    def corrupt_image( self , original_image ) :
+        """
+        Apply all applicable corruptions.
+        Args:
+            original_image: The original image.  Same size as self._state_img_orig.
+        Returns:
+            The corrupted image.  Same size as self._state_img_orig.
+        """
+        state_img_corrupted = self._affine_corruptor( torch.from_numpy( np.expand_dims( original_image , axis=0 ) ) )
+        state_img_corrupted = self._brightness_corruptor( state_img_corrupted ).squeeze().numpy()
+        return state_img_corrupted
         
     def partial_reset( self ) :
 
@@ -390,10 +409,13 @@ class MnistCorrupted_kmeans( MnistCorrupted ) :
         self._K = K
 
         # redefine the observation space to match this evnironment
-        self.observation_space = spaces.Box(                 low=0 , high=255 , shape=( MNIST_ORIG_SIZE , MNIST_ORIG_SIZE , self._K + 1 ) , dtype=np.uint8 )
+        self.observation_space = spaces.Box( low=0 , high=255 , shape=( self._img_size , self._img_size , self._K + 1 ) , dtype=np.uint8 )
 
-        # create kmeans training data from the training data loader
-        X = self._mnist_train.data.numpy().reshape( self._N_train , MNIST_ORIG_SIZE*MNIST_ORIG_SIZE )
+        # load the mnist training data with padding
+        # corrupt the images before adding to the training set
+        X = np.zeros( ( self._N_train , self._img_size * self._img_size ) )
+        for i in range( self._N_train ) :
+            X[i,:] = self._pad_func( self._mnist_train.data[ i , : , : ] ).numpy().flatten()
 
         # fit the kmeans model
         self._kmeans = KMeans( n_clusters=self._K , random_state=0 )
@@ -413,14 +435,18 @@ class MnistCorrupted_kmeans( MnistCorrupted ) :
             self._cluster_ratios[ k , : ] = np.bincount( tmp , minlength=10 ) / float( len( tmp ) )
 
     def reward_function(self, observed_image, verbose=False):
+        """
+        Reward function for the environment.  Reward is based on the ratio of the number of images in the cluster with the correct label.  If the image is blank, the reward is -100.
+        Args:
+            observed_image: The image that the agent has observed.  A numpy ndarray of size MxM.
+        Returns:
+            The reward for the current state.
+        """
         
-        # what does the classifier think the image is?
-        tmp_img = self._cropper( torch.from_numpy( np.rollaxis( np.expand_dims( observed_image , axis=2 ) , axis=2 , start=0 ) ) ).squeeze().numpy()
-        yhat = self._kmeans.predict( tmp_img.flatten().reshape(1,-1).astype(float) )[0]
-
         if self.check_if_observation_is_blank( observed_image ) :
             return -100.0
         
+        yhat = self._kmeans.predict( observed_image.flatten().reshape(1,-1).astype(float) )[0]
         correct_class_ratio = self._cluster_ratios[ yhat , self._state_img_label ]
         reward = 200.0 * correct_class_ratio - 100.0
         return reward
@@ -429,13 +455,13 @@ class MnistCorrupted_kmeans( MnistCorrupted ) :
         """
         Build an observation by adding the cluster means to the observation.
         Args:
-            observation_current: the current observation as a numpy ndarray
+            observation_current: the current observation as a numpy ndarray of size MxMx1
         Returns:
             The full observation as a numpy ndarray
         """
 
-        observation_full = self._kmeans.cluster_centers_.reshape( self._K , MNIST_ORIG_SIZE , MNIST_ORIG_SIZE )
-        observation_full = np.concatenate( ( observation_full , self._cropper( torch.movedim( torch.from_numpy( observation_current ) , 2 , 0 ) ) ) , axis=0 )
+        observation_full = self._kmeans.cluster_centers_.reshape( self._K , self._img_size , self._img_size )
+        observation_full = np.concatenate( ( observation_full , torch.movedim( torch.from_numpy( observation_current ) , 2 , 0 ) ) , axis=0 )
         observation_full = np.moveaxis( observation_full , 0 , 2 )
         return observation_full
     
@@ -466,7 +492,7 @@ class MnistCorrupted_kmeans( MnistCorrupted ) :
         for k in range( self._K ) :
             ax = fig.add_subplot( nrows , ncols , k+1 )
             ax.set_title( f"Class {self._cluster_labels[k]}" )
-            ax.imshow( self._kmeans.cluster_centers_[ k ].reshape( MNIST_ORIG_SIZE , MNIST_ORIG_SIZE ) , cmap='gray' )
+            ax.imshow( self._kmeans.cluster_centers_[ k ].reshape( self._img_size , self._img_size ) , cmap='gray' )
             ax.set_xticks([])
             ax.set_yticks([])
         fig.show()

@@ -47,7 +47,7 @@ for i in range(10):
 
 # test brightness action
 print('Testing shift left action')
-env.reset()
+
 fig = env.render()
 time.sleep(1)
 for i in range(10):
@@ -117,3 +117,6 @@ for i in range(20):
     new_image, reward, done, info = env.step( 7 )
     fig = env.render(fig_in=fig)
     time.sleep(1)
+
+print('Testing creation of kmeans environment')
+env = MnistCorrupted_kmeans( test_auto_corr_classifier , selected_corruptions=[ 'translation', 'rotation' , 'brightness' ] , kmeans=True )
