@@ -5,20 +5,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from SimpleNetMNIST.simpnet import SimpnetSlim310K
 from abc import ABC , abstractmethod
 import matplotlib.pyplot as plt
+import math
 
 
 class MnistClassifier( ABC ) :
 
-    def __init__( self , root_dir_in ) :
+    def __init__( self , train_loader , test_loader ) :
 
         # load the MNIST training data set
-        self._mnist_train = torchvision.datasets.MNIST( root=root_dir_in , train=True , download=True , transform=ToTensor() )
-        self._train_loader = torch.utils.data.DataLoader( self._mnist_train , batch_size=1 , shuffle=True , num_workers=0 )
+        self._train_loader = train_loader
         # load the MNIST test data set
-        self._mnist_test = torchvision.datasets.MNIST( root=root_dir_in , train=False , download=True , transform=ToTensor() )
-        self._test_loader = torch.utils.data.DataLoader( self._mnist_test , batch_size=1 , shuffle=True , num_workers=0 )
+        self._test_loader = test_loader
+        # number of classes
+        self._num_classes = 10
 
 
     @abstractmethod
@@ -38,6 +40,82 @@ class MnistClassifier( ABC ) :
             The probability of membership in each class.
         """ 
         pass
+
+class MnistClassifierSimpleNet( MnistClassifier ) :
+    """
+    A simple neural network for classifying MNIST images in PyTorch.
+    """
+
+    def __init__( self , train_loader , test_loader , num_epochs=10 ) :
+
+        super().__init__( train_loader , test_loader )
+        # the classifier
+        self._classifier = simpnet_slim = SimpnetSlim310K(
+            in_channels=1,
+            out_features= self._num_classes
+        )
+        self._num_epochs = num_epochs
+
+    def train( self ) :
+        """
+        Trains the simple net.
+        """
+
+        optimizer = self._classifier.get_optimizer( 
+                torch.optim.RMSprop,
+                momentum=0.9,
+                eps=math.sqrt(0.001),
+                lr=0.00001,
+                weight_decay=0.0981
+            )
+        
+        loss_fn = nn.CrossEntropyLoss()
+        
+        running_acc = 0.0
+        running_loss = 0.0
+        for epoch_i in range( 10 ) :
+            for data_i , data in enumerate( self._train_loader ):
+
+                print( f'Batch {data_i} of {len( self._train_loader )}' )
+
+                inputs, labels = data
+
+                optimizer.zero_grad()
+
+                outputs = self._classifier(inputs)
+
+                loss = loss_fn(outputs, labels)
+                loss.backward()
+
+                optimizer.step()
+
+                running_loss += loss.item()
+                correct = torch.sum(labels == torch.argmax(outputs, dim=1)).item()
+                running_acc += correct / len(labels)
+
+        return running_loss / len( self._train_loader ) , running_acc / len( self._train_loader )
+
+    def test( self ) :
+
+        loss_fn = nn.CrossEntropyLoss()
+
+        with torch.inference_mode():
+
+            for data in self._test_loader :
+                inputs, labels = data
+                outputs = self._classifier(inputs)    
+                loss = loss_fn(outputs, labels)
+                
+                running_loss += loss.item()
+                correct = torch.sum(labels == torch.argmax(outputs, dim=1)).item()
+                running_acc += correct / len(labels)
+
+        print( f'Loss: {running_loss / len( self._test_loader )} Accuracy: {running_acc / len( self._test_loader )}' )
+        return running_loss / len( self._test_loader ) , running_acc / len( self._test_loader )
+
+    def classify( self , image_in ) :
+        pass
+
 
 class MnistClassifierCNN( MnistClassifier ) :
     """
